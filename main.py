@@ -1,18 +1,18 @@
 import asyncio
 import logging
 import os
-import signal
-import traceback
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Optional
 
-import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
+from pymongo import AsyncMongoClient
+from pymongo.errors import PyMongoError
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -24,12 +24,18 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_forwarder")
 PORT = int(os.getenv("PORT", "8000"))
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-db: Optional[asyncpg.Pool] = None
+mongo_client: Optional[AsyncMongoClient] = None
+db = None
+users_col = None
+settings_col = None
+tasks_col = None
+
 clients: dict[int, Client] = {}
 client_locks: dict[int, asyncio.Lock] = {}
 tasks: dict[int, asyncio.Task] = {}
@@ -38,6 +44,8 @@ pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
 def get_client_lock(user_id: int) -> asyncio.Lock:
@@ -49,89 +57,58 @@ def get_task_lock(user_id: int) -> asyncio.Lock:
 
 
 async def init_db():
-    global db
-    db = await asyncpg.create_pool(
+    global mongo_client, db, users_col, settings_col, tasks_col
+    mongo_client = AsyncMongoClient(
         DATABASE_URL,
-        min_size=1,
-        max_size=10,
-        command_timeout=60,
-        server_settings={"application_name": "multi-user-telegram-forwarder"},
+        serverSelectionTimeoutMS=15000,
+        connectTimeoutMS=15000,
+        appname="multi-user-telegram-forwarder",
     )
-    async with db.acquire() as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            telegram_user_id BIGINT PRIMARY KEY,
-            session_string TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='user_sessions' AND column_name='session_ciphertext'
-            ) AND NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name='user_sessions' AND column_name='session_string'
-            ) THEN
-                ALTER TABLE user_sessions RENAME COLUMN session_ciphertext TO session_string;
-            END IF;
-        END $$;
-        CREATE TABLE IF NOT EXISTS user_settings (
-            telegram_user_id BIGINT PRIMARY KEY REFERENCES user_sessions(telegram_user_id) ON DELETE CASCADE,
-            caption TEXT NOT NULL DEFAULT '',
-            disabled_types JSONB NOT NULL DEFAULT '[]'::jsonb
-        );
-        CREATE TABLE IF NOT EXISTS forwarding_tasks (
-            telegram_user_id BIGINT PRIMARY KEY REFERENCES user_sessions(telegram_user_id) ON DELETE CASCADE,
-            source_chat_id BIGINT NOT NULL,
-            destination_chat_id BIGINT NOT NULL,
-            start_message_id BIGINT NOT NULL,
-            end_message_id BIGINT NOT NULL,
-            next_message_id BIGINT NOT NULL,
-            success_count BIGINT NOT NULL DEFAULT 0,
-            failed_count BIGINT NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'queued',
-            caption TEXT NOT NULL DEFAULT '',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
+    await mongo_client.admin.command("ping")
+    db = mongo_client[MONGO_DB_NAME]
+    users_col = db["user_sessions"]
+    settings_col = db["user_settings"]
+    tasks_col = db["forwarding_tasks"]
+
+    await users_col.create_index("_id", unique=True)
+    await settings_col.create_index("_id", unique=True)
+    await tasks_col.create_index("_id", unique=True)
+    await tasks_col.create_index("status")
+    log.info("Connected to MongoDB database '%s'", MONGO_DB_NAME)
 
 
 async def save_task(user_id: int, **values):
-    assert db
+    if tasks_col is None:
+        return
     allowed = {
         "next_message_id", "success_count", "failed_count", "status",
         "caption", "updated_at"
     }
-    fields = [(k, v) for k, v in values.items() if k in allowed]
-    if not fields:
+    update = {k: v for k, v in values.items() if k in allowed}
+    if not update:
         return
-    assignments = ", ".join(f"{k} = ${i+2}" for i, (k, _) in enumerate(fields))
-    args = [user_id] + [v for _, v in fields]
-    async with db.acquire() as conn:
-        await conn.execute(
-            f"UPDATE forwarding_tasks SET {assignments}, updated_at = NOW() WHERE telegram_user_id = $1",
-            *args,
-        )
+    update["updated_at"] = now_utc()
+    await tasks_col.update_one({"_id": user_id}, {"$set": update})
 
 
 async def get_user_client(user_id: int) -> Optional[Client]:
     if user_id in clients:
         return clients[user_id]
-    assert db
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT session_string FROM user_sessions WHERE telegram_user_id=$1",
-            user_id,
-        )
-    if not row:
+    if users_col is None:
         return None
-    session_string = row["session_string"]
 
     async with get_client_lock(user_id):
         if user_id in clients:
             return clients[user_id]
+
+        row = await users_col.find_one({"_id": user_id})
+        if not row:
+            return None
+
+        session_string = row.get("session_string")
+        if not session_string:
+            return None
+
         client = Client(
             name=f"user_{user_id}",
             api_id=API_ID,
@@ -157,17 +134,20 @@ async def connect_user_session(user_id: int, session_string: str):
     )
     await client.start()
     me = await client.get_me()
-    assert db
-    async with db.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO user_sessions(telegram_user_id, session_string)
-            VALUES($1, $2)
-            ON CONFLICT(telegram_user_id) DO UPDATE
-            SET session_string=EXCLUDED.session_string, updated_at=NOW()
-            """,
-            user_id, session_string,
-        )
+
+    assert users_col is not None
+    await users_col.update_one(
+        {"_id": user_id},
+        {
+            "$set": {
+                "session_string": session_string,
+                "updated_at": now_utc(),
+            },
+            "$setOnInsert": {"created_at": now_utc()},
+        },
+        upsert=True,
+    )
+
     old = clients.get(user_id)
     if old:
         with suppress(Exception):
@@ -176,24 +156,19 @@ async def connect_user_session(user_id: int, session_string: str):
     return me
 
 
-async def run_forwarding(user_id: int, row):
-    assert db
+async def run_forwarding(user_id: int, row: dict):
     source = int(row["source_chat_id"])
     destination = int(row["destination_chat_id"])
     current = int(row["next_message_id"])
     end = int(row["end_message_id"])
-    success = int(row["success_count"])
-    failed = int(row["failed_count"])
-    caption = row["caption"] or ""
-    disabled_types = set()
-    async with db.acquire() as conn:
-        settings = await conn.fetchrow(
-            "SELECT caption, disabled_types FROM user_settings WHERE telegram_user_id=$1",
-            user_id,
-        )
-    if settings:
-        caption = settings["caption"] or caption
-        disabled_types = set(settings["disabled_types"] or [])
+    success = int(row.get("success_count", 0))
+    failed = int(row.get("failed_count", 0))
+    caption = row.get("caption", "") or ""
+
+    settings = await settings_col.find_one({"_id": user_id}) if settings_col is not None else None
+    disabled_types = set(settings.get("disabled_types", [])) if settings else set()
+    if settings and settings.get("caption"):
+        caption = settings["caption"]
 
     try:
         client = await get_user_client(user_id)
@@ -225,6 +200,7 @@ async def run_forwarding(user_id: int, row):
                     media_type = "voice"
                 elif message.document:
                     media_type = "file"
+
                 if media_type in disabled_types:
                     current += 1
                     await save_task(user_id, next_message_id=current)
@@ -252,6 +228,7 @@ async def run_forwarding(user_id: int, row):
                     failed_count=failed,
                 )
                 await asyncio.sleep(1.05)
+
             except FloodWait as exc:
                 await asyncio.sleep(int(getattr(exc, "value", 30)) + 1)
             except asyncio.CancelledError:
@@ -269,6 +246,7 @@ async def run_forwarding(user_id: int, row):
         else:
             await save_task(user_id, status="completed")
             log.info("Forwarding completed for %s", user_id)
+
     except asyncio.CancelledError:
         await save_task(user_id, status="cancelled")
         raise
@@ -278,18 +256,14 @@ async def run_forwarding(user_id: int, row):
 
 
 async def launch_saved_task(user_id: int):
-    if user_id in tasks and not tasks[user_id].done():
+    running = tasks.get(user_id)
+    if running and not running.done():
         return False
-    assert db
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM forwarding_tasks WHERE telegram_user_id=$1",
-            user_id,
-        )
-    if not row:
+
+    row = await tasks_col.find_one({"_id": user_id}) if tasks_col is not None else None
+    if not row or row.get("status") in ("completed", "cancelled"):
         return False
-    if row["status"] in ("completed", "cancelled"):
-        return False
+
     tasks[user_id] = asyncio.create_task(run_forwarding(user_id, row))
     return True
 
@@ -324,7 +298,7 @@ async def connect_handler(message: Message):
     pending_connect.add(message.from_user.id)
     await message.answer(
         "Send your Pyrogram String Session in your next message.\n"
-        "The session will be stored in PostgreSQL without application-level encryption. "
+        "The session will be stored in MongoDB without application-level encryption. "
         "Do not share it with anyone else."
     )
 
@@ -334,20 +308,22 @@ async def disconnect_handler(message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
+
     task = tasks.get(uid)
     if task and not task.done():
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
     client = clients.pop(uid, None)
     if client:
         with suppress(Exception):
             await client.stop()
-    assert db
-    async with db.acquire() as conn:
-        await conn.execute("DELETE FROM user_sessions WHERE telegram_user_id=$1", uid)
-    await message.answer("Your saved session and forwarding task data have been deleted.")
 
+    await users_col.delete_one({"_id": uid})
+    await settings_col.delete_one({"_id": uid})
+    await tasks_col.delete_one({"_id": uid})
+    await message.answer("Your saved session and forwarding task data have been deleted.")
 
 
 @dp.message(Command("caption"))
@@ -356,23 +332,19 @@ async def caption_handler(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 1:
-        assert db
-        async with db.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT caption FROM user_settings WHERE telegram_user_id=$1",
-                message.from_user.id,
-            )
-        return await message.answer(f"Current caption: {row['caption'] if row else '(empty)'}")
-    assert db
-    async with db.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO user_settings(telegram_user_id, caption)
-            VALUES($1,$2)
-            ON CONFLICT(telegram_user_id) DO UPDATE SET caption=EXCLUDED.caption
-            """,
-            message.from_user.id, parts[1],
+        row = await settings_col.find_one({"_id": message.from_user.id})
+        return await message.answer(
+            f"Current caption: {row.get('caption', '') if row else '(empty)'}"
         )
+
+    await settings_col.update_one(
+        {"_id": message.from_user.id},
+        {
+            "$set": {"caption": parts[1], "updated_at": now_utc()},
+            "$setOnInsert": {"disabled_types": []},
+        },
+        upsert=True,
+    )
     await message.answer("Caption saved for your forwarding tasks.")
 
 
@@ -380,16 +352,14 @@ async def caption_handler(message: Message):
 async def delete_caption_handler(message: Message):
     if not message.from_user:
         return
-    assert db
-    async with db.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO user_settings(telegram_user_id, caption)
-            VALUES($1,'')
-            ON CONFLICT(telegram_user_id) DO UPDATE SET caption=''
-            """,
-            message.from_user.id,
-        )
+    await settings_col.update_one(
+        {"_id": message.from_user.id},
+        {
+            "$set": {"caption": "", "updated_at": now_utc()},
+            "$setOnInsert": {"disabled_types": []},
+        },
+        upsert=True,
+    )
     await message.answer("Your forwarding caption was cleared.")
 
 
@@ -401,28 +371,29 @@ async def filter_handler(message: Message):
     valid = {"text", "photo", "video", "gif", "audio", "voice", "file"}
     if len(parts) != 2 or parts[1].lower() not in valid:
         return await message.answer("Usage: /filter text|photo|video|gif|audio|voice|file")
+
+    uid = message.from_user.id
     kind = parts[1].lower()
-    assert db
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT disabled_types FROM user_settings WHERE telegram_user_id=$1",
-            message.from_user.id,
-        )
-        disabled = set(row["disabled_types"] or []) if row else set()
-        if kind in disabled:
-            disabled.remove(kind)
-            state = "enabled"
-        else:
-            disabled.add(kind)
-            state = "disabled"
-        await conn.execute(
-            """
-            INSERT INTO user_settings(telegram_user_id, disabled_types)
-            VALUES($1,$2::jsonb)
-            ON CONFLICT(telegram_user_id) DO UPDATE SET disabled_types=EXCLUDED.disabled_types
-            """,
-            message.from_user.id, __import__("json").dumps(sorted(disabled)),
-        )
+    row = await settings_col.find_one({"_id": uid})
+    disabled = set(row.get("disabled_types", [])) if row else set()
+    if kind in disabled:
+        disabled.remove(kind)
+        state = "enabled"
+    else:
+        disabled.add(kind)
+        state = "disabled"
+
+    await settings_col.update_one(
+        {"_id": uid},
+        {
+            "$set": {
+                "disabled_types": sorted(disabled),
+                "updated_at": now_utc(),
+            },
+            "$setOnInsert": {"caption": ""},
+        },
+        upsert=True,
+    )
     await message.answer(f"{kind} forwarding {state}.")
 
 
@@ -430,13 +401,8 @@ async def filter_handler(message: Message):
 async def filters_handler(message: Message):
     if not message.from_user:
         return
-    assert db
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT disabled_types FROM user_settings WHERE telegram_user_id=$1",
-            message.from_user.id,
-        )
-    disabled = set(row["disabled_types"] or []) if row else set()
+    row = await settings_col.find_one({"_id": message.from_user.id})
+    disabled = set(row.get("disabled_types", [])) if row else set()
     types = ["text", "photo", "video", "gif", "audio", "voice", "file"]
     await message.answer("\n".join(
         f"{kind}: {'OFF' if kind in disabled else 'ON'}" for kind in types
@@ -449,11 +415,13 @@ async def forward_handler(message: Message):
         return
     uid = message.from_user.id
     parts = (message.text or "").split()
+
     if len(parts) != 5:
         return await message.answer(
             "Usage:\n/forward SOURCE_CHAT_ID DESTINATION_CHAT_ID START_ID END_ID\n"
             "Example: /forward -1001234567890 -1009876543210 1 500"
         )
+
     try:
         source, destination, start_id, end_id = map(int, parts[1:])
         if start_id < 1 or end_id < start_id:
@@ -473,27 +441,31 @@ async def forward_handler(message: Message):
     async with get_task_lock(uid):
         running = tasks.get(uid)
         if running and not running.done():
-            return await message.answer("You already have a forwarding task running. Use /status or /cancel.")
-        assert db
-        async with db.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO forwarding_tasks(
-                    telegram_user_id, source_chat_id, destination_chat_id,
-                    start_message_id, end_message_id, next_message_id,
-                    success_count, failed_count, status, caption
-                ) VALUES($1,$2,$3,$4,$5,$4,0,0,'queued','')
-                ON CONFLICT(telegram_user_id) DO UPDATE SET
-                    source_chat_id=EXCLUDED.source_chat_id,
-                    destination_chat_id=EXCLUDED.destination_chat_id,
-                    start_message_id=EXCLUDED.start_message_id,
-                    end_message_id=EXCLUDED.end_message_id,
-                    next_message_id=EXCLUDED.next_message_id,
-                    success_count=0, failed_count=0, status='queued', caption=''
-                """,
-                uid, source, destination, start_id, end_id,
+            return await message.answer(
+                "You already have a forwarding task running. Use /status or /cancel."
             )
+
+        await tasks_col.update_one(
+            {"_id": uid},
+            {
+                "$set": {
+                    "source_chat_id": source,
+                    "destination_chat_id": destination,
+                    "start_message_id": start_id,
+                    "end_message_id": end_id,
+                    "next_message_id": start_id,
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "status": "queued",
+                    "caption": "",
+                    "updated_at": now_utc(),
+                },
+                "$setOnInsert": {"created_at": now_utc()},
+            },
+            upsert=True,
+        )
         await launch_saved_task(uid)
+
     await message.answer("Forwarding task started. Use /status to check progress.")
 
 
@@ -501,18 +473,15 @@ async def forward_handler(message: Message):
 async def status_handler(message: Message):
     if not message.from_user:
         return
-    assert db
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM forwarding_tasks WHERE telegram_user_id=$1",
-            message.from_user.id,
-        )
+    row = await tasks_col.find_one({"_id": message.from_user.id})
     if not row:
         return await message.answer("No forwarding task found.")
+
     await message.answer(
-        f"Status: {row['status']}\n"
-        f"Next message ID: {row['next_message_id']} / {row['end_message_id']}\n"
-        f"Success: {row['success_count']}\nFailed: {row['failed_count']}"
+        f"Status: {row.get('status', 'unknown')}\n"
+        f"Next message ID: {row.get('next_message_id', 0)} / {row.get('end_message_id', 0)}\n"
+        f"Success: {row.get('success_count', 0)}\n"
+        f"Failed: {row.get('failed_count', 0)}"
     )
 
 
@@ -524,6 +493,7 @@ async def cancel_handler(message: Message):
     task = tasks.get(uid)
     if not task or task.done():
         return await message.answer("No active forwarding task.")
+
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
@@ -534,29 +504,42 @@ async def cancel_handler(message: Message):
 async def session_message_handler(message: Message):
     if not message.from_user or message.from_user.id not in pending_connect:
         return
+
     uid = message.from_user.id
     session_string = (message.text or "").strip()
     pending_connect.discard(uid)
+
     # Best-effort removal of the message containing the sensitive session string.
     with suppress(Exception):
         await message.delete()
+
     if not session_string or len(session_string) < 40:
-        return await bot.send_message(uid, "That does not look like a valid Pyrogram session string. Try /connect again.")
+        return await bot.send_message(
+            uid,
+            "That does not look like a valid Pyrogram session string. Try /connect again."
+        )
+
     try:
         me = await connect_user_session(uid, session_string)
         await bot.send_message(
             uid,
             f"Session connected successfully.\nAccount: {me.first_name or 'Telegram user'}"
         )
-        # Resume a task left queued by a previous restart.
         await launch_saved_task(uid)
     except Exception as exc:
         log.exception("Session connect failed for user %s", uid)
-        await bot.send_message(uid, f"Session connection failed: {type(exc).__name__}. Check the string and try /connect again.")
+        await bot.send_message(
+            uid,
+            f"Session connection failed: {type(exc).__name__}. Check the string and try /connect again."
+        )
 
 
 async def health(request):
-    return web.json_response({"status": "ok", "service": "multi-user-telegram-forwarder"})
+    return web.json_response({
+        "status": "ok",
+        "service": "multi-user-telegram-forwarder",
+        "database": "mongodb",
+    })
 
 
 async def start_health_server():
@@ -571,21 +554,18 @@ async def start_health_server():
 
 
 async def restore_clients_and_tasks():
-    assert db
-    async with db.acquire() as conn:
-        rows = await conn.fetch("SELECT telegram_user_id FROM user_sessions")
-    for row in rows:
-        uid = int(row["telegram_user_id"])
+    async for row in users_col.find({}, {"_id": 1}):
+        uid = int(row["_id"])
         try:
             await get_user_client(uid)
         except Exception:
             log.exception("Could not restore user client %s", uid)
-    async with db.acquire() as conn:
-        pending = await conn.fetch(
-            "SELECT telegram_user_id FROM forwarding_tasks WHERE status IN ('queued','running','waiting_for_session')"
-        )
-    for row in pending:
-        uid = int(row["telegram_user_id"])
+
+    async for row in tasks_col.find(
+        {"status": {"$in": ["queued", "running", "waiting_for_session"]}},
+        {"_id": 1},
+    ):
+        uid = int(row["_id"])
         try:
             await launch_saved_task(uid)
         except Exception:
@@ -596,8 +576,12 @@ async def main():
     await init_db()
     health_runner = await start_health_server()
     await restore_clients_and_tasks()
-    polling = asyncio.create_task(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
+
+    polling = asyncio.create_task(
+        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    )
     log.info("Bot started; listening on port %s", PORT)
+
     try:
         await polling
     finally:
@@ -605,19 +589,23 @@ async def main():
         polling.cancel()
         with suppress(asyncio.CancelledError):
             await polling
-        active = [t for t in tasks.values() if not t.done()]
+
+        active = [task for task in tasks.values() if not task.done()]
         for task in active:
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+
         for client in list(clients.values()):
             with suppress(Exception):
                 await client.stop()
+
         with suppress(Exception):
             await bot.session.close()
         await health_runner.cleanup()
-        if db:
-            await db.close()
+
+        if mongo_client is not None:
+            await mongo_client.close()
 
 
 if __name__ == "__main__":
