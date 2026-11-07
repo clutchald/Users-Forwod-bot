@@ -153,6 +153,21 @@ async def connect_user_session(user_id: int, session_string: str):
     return me
 
 
+async def warm_chat_peers(client: Client, chat_ids: set[int]) -> set[int]:
+    """Load chat access hashes into this user's Pyrogram session cache."""
+    found: set[int] = set()
+    async for dialog in client.get_dialogs():
+        chat = getattr(dialog, "chat", None)
+        if chat is None:
+            continue
+        chat_id = int(chat.id)
+        if chat_id in chat_ids:
+            found.add(chat_id)
+            if found == chat_ids:
+                break
+    return found
+
+
 async def run_forwarding(user_id: int, row: dict):
     source = int(row["source_chat_id"])
     destination = int(row["destination_chat_id"])
@@ -171,6 +186,21 @@ async def run_forwarding(user_id: int, row: dict):
         client = await get_user_client(user_id)
         if not client:
             await save_task(user_id, status="waiting_for_session")
+            return
+
+        # A StringSession does not necessarily contain cached peer/access-hash
+        # data. Load the user's dialogs before using numeric source/destination IDs.
+        required_chats = {source, destination}
+        cached_chats = await warm_chat_peers(client, required_chats)
+        missing_chats = required_chats - cached_chats
+        if missing_chats:
+            log.error(
+                "User %s cannot access source/destination chat(s) %s. "
+                "The connected account must join/open both chats first.",
+                user_id,
+                sorted(missing_chats),
+            )
+            await save_task(user_id, status="chat_not_found")
             return
 
         await save_task(user_id, status="running")
