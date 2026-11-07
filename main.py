@@ -11,8 +11,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, Message
-from pyrogram import Client, filters
-from pyrogram.handlers import MessageHandler
+from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 from pymongo import AsyncMongoClient
 from pymongo.errors import PyMongoError
@@ -44,11 +43,7 @@ client_locks: dict[int, asyncio.Lock] = {}
 tasks: dict[int, asyncio.Task] = {}
 task_locks: dict[int, asyncio.Lock] = {}
 speed_delays: dict[int, float] = {}  # Cached per-user delay; avoids a DB read per message.
-caption_cache: dict[int, str] = {}  # Live per-user caption; changes apply to active tasks.
 PROGRESS_SAVE_EVERY = 10  # Batch progress writes to reduce MongoDB overhead.
-live_progress: dict[int, dict] = {}
-status_monitors: dict[int, asyncio.Task] = {}
-userbot_handler_clients: dict[int, Client] = {}
 pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
 APP_STARTED_MONOTONIC = __import__('time').monotonic()
@@ -118,78 +113,6 @@ async def save_task(user_id: int, **values):
     await tasks_col.update_one({"_id": user_id}, {"$set": update})
 
 
-def register_userbot_commands(client: Client, user_id: int):
-    """Enable the legacy .id and .f commands in each connected user's Telegram account."""
-    if userbot_handler_clients.get(user_id) is client:
-        return
-
-    async def id_handler(_, message):
-        try:
-            if message.reply_to_message:
-                response = (
-                    f"Chat ID: `{message.chat.id}`\n"
-                    f"Msg ID: `{message.reply_to_message.id}`"
-                )
-            else:
-                response = f"Chat ID: `{message.chat.id}`"
-            await message.reply_text(response)
-        except Exception:
-            log.exception(".id command failed for user %s", user_id)
-
-    async def f_handler(_, message):
-        parts = (message.text or "").split()
-        if len(parts) != 4:
-            return await message.reply_text(
-                "Usage: `.f SOURCE_CHAT_ID START_ID END_ID`\n"
-                "Example: `.f -1001234567890 1 500`\n\n"
-                "Send this command in the destination chat."
-            )
-
-        try:
-            source_chat_id, start_id, end_id = map(int, parts[1:])
-            if start_id < 1 or end_id < start_id:
-                raise ValueError
-        except ValueError:
-            return await message.reply_text("Invalid IDs. Check the source chat ID and message range.")
-
-        destination_chat_id = int(message.chat.id)
-        async with get_task_lock(user_id):
-            running = tasks.get(user_id)
-            if running and not running.done():
-                return await message.reply_text("A forwarding task is already running. Use /status or /cancel in the main bot.")
-
-            await tasks_col.update_one(
-                {"_id": user_id},
-                {
-                    "$set": {
-                        "source_chat_id": source_chat_id,
-                        "destination_chat_id": destination_chat_id,
-                        "start_message_id": start_id,
-                        "end_message_id": end_id,
-                        "next_message_id": start_id,
-                        "success_count": 0,
-                        "failed_count": 0,
-                        "status": "queued",
-                        "caption": "",
-                        "updated_at": now_utc(),
-                    },
-                    "$setOnInsert": {"created_at": now_utc()},
-                },
-                upsert=True,
-            )
-            await launch_saved_task(user_id)
-        await message.reply_text(
-            f"Forwarding started.\nSource: `{source_chat_id}`\n"
-            f"Destination: `{destination_chat_id}`\n"
-            f"Message IDs: `{start_id}` to `{end_id}`\n"
-            "Check progress with /status in the main bot."
-        )
-
-    client.add_handler(MessageHandler(id_handler, filters.me & filters.command("id", prefixes=".")))
-    client.add_handler(MessageHandler(f_handler, filters.me & filters.regex(r"^\.f(?:\s|$)")))
-    userbot_handler_clients[user_id] = client
-
-
 async def get_user_client(user_id: int) -> Optional[Client]:
     if user_id in clients:
         return clients[user_id]
@@ -214,10 +137,9 @@ async def get_user_client(user_id: int) -> Optional[Client]:
             api_hash=API_HASH,
             session_string=session_string,
             in_memory=True,
-            no_updates=False,
+            no_updates=True,
         )
         await client.start()
-        register_userbot_commands(client, user_id)
         clients[user_id] = client
         log.info("Started Telegram user client for %s", user_id)
         return client
@@ -230,10 +152,9 @@ async def connect_user_session(user_id: int, session_string: str):
         api_hash=API_HASH,
         session_string=session_string,
         in_memory=True,
-        no_updates=False,
+        no_updates=True,
     )
     await client.start()
-    register_userbot_commands(client, user_id)
     try:
         me = await client.get_me()
 
@@ -292,7 +213,6 @@ async def run_forwarding(user_id: int, row: dict):
 
     disabled_types = set(settings.get("disabled_types", [])) if settings else set()
     caption = (settings.get("caption") if settings else None) or row.get("caption", "") or ""
-    caption_cache[user_id] = caption
     speed_delays[user_id] = max(
         0.5, min(float(settings.get("speed_delay", 1.05)) if settings else 1.05, 30.0)
     )
@@ -301,12 +221,6 @@ async def run_forwarding(user_id: int, row: dict):
 
     async def checkpoint(force: bool = False):
         nonlocal processed_since_checkpoint
-        live_progress[user_id] = {
-            "next_message_id": current,
-            "success_count": success,
-            "failed_count": failed,
-            "status": "running",
-        }
         if force or processed_since_checkpoint >= PROGRESS_SAVE_EVERY:
             await save_task(
                 user_id,
@@ -365,7 +279,7 @@ async def run_forwarding(user_id: int, row: dict):
 
                 while True:
                     try:
-                        await message.copy(destination, caption=(caption_cache.get(user_id, caption) or None))
+                        await message.copy(destination, caption=caption or None)
                         success += 1
                         break
                     except FloodWait as exc:
@@ -400,10 +314,8 @@ async def run_forwarding(user_id: int, row: dict):
 
         await checkpoint(force=True)
         if shutdown_event.is_set():
-            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "queued"}
             await save_task(user_id, status="queued")
         else:
-            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "completed"}
             await save_task(user_id, status="completed")
             log.info(
                 "Forwarding completed user=%s success=%s failed=%s",
@@ -411,7 +323,6 @@ async def run_forwarding(user_id: int, row: dict):
             )
 
     except asyncio.CancelledError:
-        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "cancelled"}
         await save_task(
             user_id,
             next_message_id=current,
@@ -422,7 +333,6 @@ async def run_forwarding(user_id: int, row: dict):
         raise
     except Exception:
         log.exception("Forwarding task crashed for %s", user_id)
-        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "error"}
         await save_task(
             user_id,
             next_message_id=current,
@@ -459,10 +369,6 @@ async def start_handler(message: Message):
         "• <code>/status</code> — View task progress\n"
         "• <code>/cancel</code> — Stop your active task\n"
         "• <code>/speed [seconds]</code> — Set forwarding delay\n\n"
-        "<b>◈ LEGACY USERBOT COMMANDS</b>\n"
-        "• <code>.id</code> — Send inside the source bot chat to get its Chat ID\n"
-        "• Reply to a post with <code>.id</code> to get that Message ID\n"
-        "• <code>.f SOURCE_CHAT_ID START_ID END_ID</code> — Send in the destination chat\n\n"
         "<b>◈ CUSTOMIZATION</b>\n"
         "• <code>/caption TEXT</code> — Set a custom caption\n"
         "• <code>/dcaption</code> — Clear your caption\n"
@@ -472,7 +378,7 @@ async def start_handler(message: Message):
         "<b>⚡ QUICK START</b>\n"
         "1. Connect your account with <code>/connect</code>\n"
         "2. Set your preferred delay with <code>/speed 1</code>\n"
-        "3. Or use .id in the source chat, then .f in the destination chat\n\n"
+        "3. Start using <code>/forward</code>\n\n"
         "<i>Need help? Send /help</i>"
     )
     await message.answer(menu_text, parse_mode="HTML", disable_web_page_preview=True)
@@ -537,8 +443,7 @@ async def caption_handler(message: Message):
         },
         upsert=True,
     )
-    caption_cache[message.from_user.id] = parts[1]
-    await message.answer("Caption updated. It will apply to the next messages in active forwarding tasks.")
+    await message.answer("Caption saved for your forwarding tasks.")
 
 
 @dp.message(Command("dcaption"))
@@ -553,8 +458,7 @@ async def delete_caption_handler(message: Message):
         },
         upsert=True,
     )
-    caption_cache[message.from_user.id] = ""
-    await message.answer("Caption cleared. The change will apply to the next messages in active forwarding tasks.")
+    await message.answer("Your forwarding caption was cleared.")
 
 
 @dp.message(Command("speed", "forwardingspeed"))
@@ -705,13 +609,20 @@ async def forward_handler(message: Message):
     await message.answer("Forwarding task started. Use /status to check progress.")
 
 
-async def build_status_dashboard(uid: int):
-    row = await tasks_col.find_one({"_id": uid})
-    settings = await settings_col.find_one({"_id": uid}, {"speed_delay": 1}) if settings_col is not None else None
-    delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
+@dp.message(Command("status"))
+async def status_handler(message: Message):
+    if not message.from_user:
+        return
 
+    uid = message.from_user.id
+    row = await tasks_col.find_one({"_id": uid})
+    settings = await settings_col.find_one(
+        {"_id": uid}, {"speed_delay": 1}
+    ) if settings_col is not None else None
+
+    # Collect host metrics without blocking the bot's asyncio event loop.
     try:
-        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.2)
         memory = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
         uptime_seconds = max(0, int(__import__("time").monotonic() - APP_STARTED_MONOTONIC))
@@ -730,95 +641,55 @@ async def build_status_dashboard(uid: int):
         log.exception("Could not collect server metrics")
         system_stats = "▣ <b>SERVER STATS</b>\nMetrics temporarily unavailable."
 
+    delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
+
     if not row:
-        return (
+        dashboard = (
             "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
-            "<i>Live personal dashboard</i>\n"
+            "<i>Your personal status dashboard</i>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "◉ <b>FORWARDING</b>\n└ No forwarding task found.\n\n"
+            "◉ <b>FORWARDING</b>\n"
+            "└ No forwarding task found.\n\n"
             f"⚡ <b>SPEED</b>\n└ {delay:g}s delay per message\n\n"
             f"{system_stats}\n\n"
-            "<i>Start a task with /forward</i>",
-            "unknown",
+            "<i>Start a task with /forward</i>"
         )
+        return await message.answer(dashboard, parse_mode="HTML")
 
-    live = live_progress.get(uid, {})
-    status = str(live.get("status", row.get("status", "unknown"))).upper().replace("_", " ")
+    status = str(row.get("status", "unknown")).upper().replace("_", " ")
     start_id = int(row.get("start_message_id", 0))
     end_id = int(row.get("end_message_id", 0))
-    next_id = int(live.get("next_message_id", row.get("next_message_id", start_id)))
+    next_id = int(row.get("next_message_id", start_id))
     total = max(0, end_id - start_id + 1)
     processed = min(total, max(0, next_id - start_id))
     remaining = max(0, total - processed)
     percent = (processed / total * 100) if total else 0
-    filled = min(20, max(0, int(percent // 5)))
-    bar = "▰" * filled + "▱" * (20 - filled)
-    success = int(live.get("success_count", row.get("success_count", 0)))
-    failed = int(live.get("failed_count", row.get("failed_count", 0)))
+    filled = min(10, max(0, int(percent // 10)))
+    progress_bar = "█" * filled + "░" * (10 - filled)
+    success = int(row.get("success_count", 0))
+    failed = int(row.get("failed_count", 0))
 
-    dashboard = (
-        "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
-        "<i>Live personal status dashboard</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "◉ <b>FORWARDING TASK</b>\n"
+    task_stats = (
+        f"◉ <b>FORWARDING TASK</b>\n"
         f"├ Status · <b>{status}</b>\n"
-        f"├ Progress · {bar} <b>{percent:.1f}%</b>\n"
+        f"├ Progress · {progress_bar} {percent:.1f}%\n"
         f"├ Messages · {processed:,}/{total:,}\n"
         f"├ Remaining · {remaining:,}\n"
         f"├ Success · <b>{success:,}</b>\n"
-        f"└ Failed · <b>{failed:,}</b>\n\n"
-        f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message\n\n"
-        f"{system_stats}\n\n"
-        "<i>Auto-refresh: every 2 seconds</i>"
+        f"└ Failed · <b>{failed:,}</b>"
     )
-    return dashboard, status.lower()
+    speed_stats = f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message"
 
-
-async def refresh_status_message(chat_id: int, message_id: int, uid: int):
-    last_text = None
-    try:
-        while True:
-            text, status = await build_status_dashboard(uid)
-            if text != last_text:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=text,
-                        parse_mode="HTML",
-                    )
-                    last_text = text
-                except Exception as exc:
-                    if "message is not modified" not in str(exc).lower():
-                        log.info("Live status refresh stopped for user %s: %s", uid, type(exc).__name__)
-                        break
-            if status not in {"queued", "running", "waiting for session"}:
-                break
-            await asyncio.sleep(2)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Live status monitor failed for user %s", uid)
-    finally:
-        if status_monitors.get(uid) is asyncio.current_task():
-            status_monitors.pop(uid, None)
-
-
-@dp.message(Command("status"))
-async def status_handler(message: Message):
-    if not message.from_user:
-        return
-    uid = message.from_user.id
-    dashboard, status = await build_status_dashboard(uid)
-    sent = await message.answer(dashboard, parse_mode="HTML")
-
-    old_monitor = status_monitors.get(uid)
-    if old_monitor and not old_monitor.done():
-        old_monitor.cancel()
-    if status in {"queued", "running", "waiting for session"}:
-        status_monitors[uid] = asyncio.create_task(
-            refresh_status_message(sent.chat.id, sent.message_id, uid)
-        )
+    dashboard = (
+        "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
+        "<i>Personal status dashboard</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{task_stats}\n\n"
+        f"{speed_stats}\n\n"
+        f"{system_stats}\n\n"
+        "<i>Use /speed 1 to change delay · /cancel to stop</i>"
+    )
+    await message.answer(dashboard, parse_mode="HTML")
 
 
 @dp.message(Command("cancel"))
