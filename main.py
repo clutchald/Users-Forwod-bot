@@ -70,9 +70,6 @@ async def init_db():
     settings_col = db["user_settings"]
     tasks_col = db["forwarding_tasks"]
 
-
-    await settings_col.create_index("_id", unique=True)
-    await tasks_col.create_index("_id", unique=True)
     await tasks_col.create_index("status")
     log.info("Connected to MongoDB database '%s'", MONGO_DB_NAME)
 
