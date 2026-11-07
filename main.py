@@ -11,7 +11,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from cryptography.fernet import Fernet, InvalidToken
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 
@@ -24,11 +23,9 @@ log = logging.getLogger("multi-user-forwarder")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.getenv("PORT", "8000"))
 
-fernet = Fernet(ENCRYPTION_KEY.encode())
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -41,12 +38,6 @@ pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
 
 
-def encrypt(value: str) -> str:
-    return fernet.encrypt(value.encode()).decode()
-
-
-def decrypt(value: str) -> str:
-    return fernet.decrypt(value.encode()).decode()
 
 
 def get_client_lock(user_id: int) -> asyncio.Lock:
@@ -70,10 +61,22 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_sessions (
             telegram_user_id BIGINT PRIMARY KEY,
-            session_ciphertext TEXT NOT NULL,
+            session_string TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='user_sessions' AND column_name='session_ciphertext'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='user_sessions' AND column_name='session_string'
+            ) THEN
+                ALTER TABLE user_sessions RENAME COLUMN session_ciphertext TO session_string;
+            END IF;
+        END $$;
         CREATE TABLE IF NOT EXISTS user_settings (
             telegram_user_id BIGINT PRIMARY KEY REFERENCES user_sessions(telegram_user_id) ON DELETE CASCADE,
             caption TEXT NOT NULL DEFAULT '',
@@ -119,16 +122,12 @@ async def get_user_client(user_id: int) -> Optional[Client]:
     assert db
     async with db.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT session_ciphertext FROM user_sessions WHERE telegram_user_id=$1",
+            "SELECT session_string FROM user_sessions WHERE telegram_user_id=$1",
             user_id,
         )
     if not row:
         return None
-    try:
-        session_string = decrypt(row["session_ciphertext"])
-    except (InvalidToken, ValueError):
-        log.exception("Could not decrypt session for user %s", user_id)
-        return None
+    session_string = row["session_string"]
 
     async with get_client_lock(user_id):
         if user_id in clients:
@@ -162,12 +161,12 @@ async def connect_user_session(user_id: int, session_string: str):
     async with db.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO user_sessions(telegram_user_id, session_ciphertext)
+            INSERT INTO user_sessions(telegram_user_id, session_string)
             VALUES($1, $2)
             ON CONFLICT(telegram_user_id) DO UPDATE
-            SET session_ciphertext=EXCLUDED.session_ciphertext, updated_at=NOW()
+            SET session_string=EXCLUDED.session_string, updated_at=NOW()
             """,
-            user_id, encrypt(session_string),
+            user_id, session_string,
         )
     old = clients.get(user_id)
     if old:
@@ -298,17 +297,17 @@ async def launch_saved_task(user_id: int):
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
-        "Welcome to Multi-User Forwarder.\\n\\n"
-        "Each Telegram user connects their own user session.\\n"
-        "/connect - connect your Telegram user session\\n"
-        "/disconnect - remove your saved session\\n"
-        "/forward SOURCE DEST START_ID END_ID - start forwarding\\n"
-        "/status - view your forwarding status\\n"
-        "/cancel - cancel your forwarding task\\n"
-        "/caption TEXT - set forwarding caption\\n"
-        "/dcaption - clear caption\\n"
-        "/filter TYPE - toggle media type\\n"
-        "/filters - show media filters\\n"
+        "Welcome to Multi-User Forwarder.\n\n"
+        "Each Telegram user connects their own user session.\n"
+        "/connect - connect your Telegram user session\n"
+        "/disconnect - remove your saved session\n"
+        "/forward SOURCE DEST START_ID END_ID - start forwarding\n"
+        "/status - view your forwarding status\n"
+        "/cancel - cancel your forwarding task\n"
+        "/caption TEXT - set forwarding caption\n"
+        "/dcaption - clear caption\n"
+        "/filter TYPE - toggle media type\n"
+        "/filters - show media filters\n"
         "/help - show commands"
     )
 
@@ -324,8 +323,8 @@ async def connect_handler(message: Message):
         return
     pending_connect.add(message.from_user.id)
     await message.answer(
-        "Send your Pyrogram String Session in your next message.\\n"
-        "The session will be encrypted before it is stored in PostgreSQL. "
+        "Send your Pyrogram String Session in your next message.\n"
+        "The session will be stored in PostgreSQL without application-level encryption. "
         "Do not share it with anyone else."
     )
 
@@ -439,7 +438,7 @@ async def filters_handler(message: Message):
         )
     disabled = set(row["disabled_types"] or []) if row else set()
     types = ["text", "photo", "video", "gif", "audio", "voice", "file"]
-    await message.answer("\\n".join(
+    await message.answer("\n".join(
         f"{kind}: {'OFF' if kind in disabled else 'ON'}" for kind in types
     ))
 
@@ -452,7 +451,7 @@ async def forward_handler(message: Message):
     parts = (message.text or "").split()
     if len(parts) != 5:
         return await message.answer(
-            "Usage:\\n/forward SOURCE_CHAT_ID DESTINATION_CHAT_ID START_ID END_ID\\n"
+            "Usage:\n/forward SOURCE_CHAT_ID DESTINATION_CHAT_ID START_ID END_ID\n"
             "Example: /forward -1001234567890 -1009876543210 1 500"
         )
     try:
@@ -511,9 +510,9 @@ async def status_handler(message: Message):
     if not row:
         return await message.answer("No forwarding task found.")
     await message.answer(
-        f"Status: {row['status']}\\n"
-        f"Next message ID: {row['next_message_id']} / {row['end_message_id']}\\n"
-        f"Success: {row['success_count']}\\nFailed: {row['failed_count']}"
+        f"Status: {row['status']}\n"
+        f"Next message ID: {row['next_message_id']} / {row['end_message_id']}\n"
+        f"Success: {row['success_count']}\nFailed: {row['failed_count']}"
     )
 
 
@@ -547,7 +546,7 @@ async def session_message_handler(message: Message):
         me = await connect_user_session(uid, session_string)
         await bot.send_message(
             uid,
-            f"Session connected successfully.\\nAccount: {me.first_name or 'Telegram user'}"
+            f"Session connected successfully.\nAccount: {me.first_name or 'Telegram user'}"
         )
         # Resume a task left queued by a previous restart.
         await launch_saved_task(uid)
