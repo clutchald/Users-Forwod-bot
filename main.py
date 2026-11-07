@@ -8,7 +8,7 @@ from typing import Optional
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import BotCommand, Message
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 from pymongo import AsyncMongoClient
@@ -42,6 +42,26 @@ tasks: dict[int, asyncio.Task] = {}
 task_locks: dict[int, asyncio.Lock] = {}
 pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
+
+
+async def setup_bot_commands():
+    """Publish the complete command list in Telegram's menu button."""
+    commands = [
+        BotCommand(command="start", description="Open the main menu"),
+        BotCommand(command="help", description="Show all commands and help"),
+        BotCommand(command="connect", description="Connect your Telegram session"),
+        BotCommand(command="disconnect", description="Remove your saved session"),
+        BotCommand(command="forward", description="Start a forwarding task"),
+        BotCommand(command="status", description="Check forwarding progress"),
+        BotCommand(command="cancel", description="Stop the active forwarding task"),
+        BotCommand(command="speed", description="Set or view forwarding speed"),
+        BotCommand(command="caption", description="Set or view forwarding caption"),
+        BotCommand(command="dcaption", description="Clear forwarding caption"),
+        BotCommand(command="filter", description="Enable or disable a media type"),
+        BotCommand(command="filters", description="View media filter settings"),
+    ]
+    await bot.set_my_commands(commands)
+    log.info("Telegram command menu configured with %d commands", len(commands))
 
 
 def now_utc():
@@ -659,6 +679,7 @@ async def restore_clients_and_tasks():
 
 async def main():
     await init_db()
+    await setup_bot_commands()
     health_runner = await start_health_server()
     await restore_clients_and_tasks()
 
