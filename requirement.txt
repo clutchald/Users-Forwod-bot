@@ -2,5 +2,4 @@ aiogram==3.22.0
 Pyrogram==2.0.106
 TgCrypto==1.2.5
 asyncpg==0.30.0
-cryptography==45.0.6
 aiohttp==3.12.15
