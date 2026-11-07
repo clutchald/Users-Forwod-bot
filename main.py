@@ -5,6 +5,8 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
 
+import psutil
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -40,8 +42,11 @@ clients: dict[int, Client] = {}
 client_locks: dict[int, asyncio.Lock] = {}
 tasks: dict[int, asyncio.Task] = {}
 task_locks: dict[int, asyncio.Lock] = {}
+speed_delays: dict[int, float] = {}  # Cached per-user delay; avoids a DB read per message.
+PROGRESS_SAVE_EVERY = 10  # Batch progress writes to reduce MongoDB overhead.
 pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
+APP_STARTED_MONOTONIC = __import__('time').monotonic()
 
 
 async def setup_bot_commands():
@@ -150,20 +155,25 @@ async def connect_user_session(user_id: int, session_string: str):
         no_updates=True,
     )
     await client.start()
-    me = await client.get_me()
+    try:
+        me = await client.get_me()
 
-    assert users_col is not None
-    await users_col.update_one(
-        {"_id": user_id},
-        {
-            "$set": {
-                "session_string": session_string,
-                "updated_at": now_utc(),
+        assert users_col is not None
+        await users_col.update_one(
+            {"_id": user_id},
+            {
+                "$set": {
+                    "session_string": session_string,
+                    "updated_at": now_utc(),
+                },
+                "$setOnInsert": {"created_at": now_utc()},
             },
-            "$setOnInsert": {"created_at": now_utc()},
-        },
-        upsert=True,
-    )
+            upsert=True,
+        )
+    except Exception:
+        with suppress(Exception):
+            await client.stop()
+        raise
 
     old = clients.get(user_id)
     if old:
@@ -195,12 +205,30 @@ async def run_forwarding(user_id: int, row: dict):
     end = int(row["end_message_id"])
     success = int(row.get("success_count", 0))
     failed = int(row.get("failed_count", 0))
-    caption = row.get("caption", "") or ""
 
-    settings = await settings_col.find_one({"_id": user_id}) if settings_col is not None else None
+    settings = await settings_col.find_one(
+        {"_id": user_id},
+        {"disabled_types": 1, "caption": 1, "speed_delay": 1},
+    ) if settings_col is not None else None
+
     disabled_types = set(settings.get("disabled_types", [])) if settings else set()
-    if settings and settings.get("caption"):
-        caption = settings["caption"]
+    caption = (settings.get("caption") if settings else None) or row.get("caption", "") or ""
+    speed_delays[user_id] = max(
+        0.5, min(float(settings.get("speed_delay", 1.05)) if settings else 1.05, 30.0)
+    )
+
+    processed_since_checkpoint = 0
+
+    async def checkpoint(force: bool = False):
+        nonlocal processed_since_checkpoint
+        if force or processed_since_checkpoint >= PROGRESS_SAVE_EVERY:
+            await save_task(
+                user_id,
+                next_message_id=current,
+                success_count=success,
+                failed_count=failed,
+            )
+            processed_since_checkpoint = 0
 
     try:
         client = await get_user_client(user_id)
@@ -208,49 +236,45 @@ async def run_forwarding(user_id: int, row: dict):
             await save_task(user_id, status="waiting_for_session")
             return
 
-        # A StringSession does not necessarily contain cached peer/access-hash
-        # data. Load the user's dialogs before using numeric source/destination IDs.
+        # Load access hashes once before processing the range.
         required_chats = {source, destination}
         cached_chats = await warm_chat_peers(client, required_chats)
         missing_chats = required_chats - cached_chats
         if missing_chats:
             log.error(
-                "User %s cannot access source/destination chat(s) %s. "
-                "The connected account must join/open both chats first.",
-                user_id,
-                sorted(missing_chats),
+                "User %s cannot access chat(s) %s; account must join both chats.",
+                user_id, sorted(missing_chats),
             )
             await save_task(user_id, status="chat_not_found")
             return
 
         await save_task(user_id, status="running")
+
         while current <= end and not shutdown_event.is_set():
             try:
                 message = await client.get_messages(source, current)
+
                 if not message or getattr(message, "empty", False) or getattr(message, "service", False):
                     current += 1
-                    await save_task(user_id, next_message_id=current)
+                    processed_since_checkpoint += 1
+                    await checkpoint()
                     continue
 
-                media_type = None
-                if message.text:
-                    media_type = "text"
-                elif message.photo:
-                    media_type = "photo"
-                elif message.video:
-                    media_type = "video"
-                elif message.animation:
-                    media_type = "gif"
-                elif message.audio:
-                    media_type = "audio"
-                elif message.voice:
-                    media_type = "voice"
-                elif message.document:
-                    media_type = "file"
+                media_type = (
+                    "text" if message.text else
+                    "photo" if message.photo else
+                    "video" if message.video else
+                    "gif" if message.animation else
+                    "audio" if message.audio else
+                    "voice" if message.voice else
+                    "file" if message.document else
+                    None
+                )
 
                 if media_type in disabled_types:
                     current += 1
-                    await save_task(user_id, next_message_id=current)
+                    processed_since_checkpoint += 1
+                    await checkpoint()
                     continue
 
                 while True:
@@ -264,49 +288,58 @@ async def run_forwarding(user_id: int, row: dict):
                         await asyncio.sleep(wait_seconds)
                     except RPCError:
                         failed += 1
-                        log.exception("Telegram error user=%s message=%s", user_id, current)
+                        log.exception("Telegram copy failed user=%s message=%s", user_id, current)
                         break
 
                 current += 1
-                await save_task(
-                    user_id,
-                    next_message_id=current,
-                    success_count=success,
-                    failed_count=failed,
-                )
-                # Read the user's current speed setting on every message so /speed
-                # changes take effect immediately, without restarting the task.
-                speed_row = await settings_col.find_one(
-                    {"_id": user_id}, {"speed_delay": 1}
-                ) if settings_col is not None else None
-                speed_delay = float(speed_row.get("speed_delay", 1.05)) if speed_row else 1.05
-                speed_delay = max(0.5, min(speed_delay, 30.0))
-                await asyncio.sleep(speed_delay)
+                processed_since_checkpoint += 1
+                await checkpoint()
+
+                # Speed changes are reflected immediately by /speed without a DB
+                # query on every message. Telegram FloodWait is always respected.
+                await asyncio.sleep(speed_delays.get(user_id, 1.05))
 
             except FloodWait as exc:
-                await asyncio.sleep(int(getattr(exc, "value", 30)) + 1)
+                wait_seconds = int(getattr(exc, "value", 30)) + 1
+                log.warning("FloodWait while reading user=%s wait=%s", user_id, wait_seconds)
+                await asyncio.sleep(wait_seconds)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 failed += 1
                 log.exception("Forwarding failure user=%s message=%s", user_id, current)
                 current += 1
-                await save_task(
-                    user_id, next_message_id=current, failed_count=failed
-                )
+                processed_since_checkpoint += 1
+                await checkpoint()
 
+        await checkpoint(force=True)
         if shutdown_event.is_set():
             await save_task(user_id, status="queued")
         else:
             await save_task(user_id, status="completed")
-            log.info("Forwarding completed for %s", user_id)
+            log.info(
+                "Forwarding completed user=%s success=%s failed=%s",
+                user_id, success, failed,
+            )
 
     except asyncio.CancelledError:
-        await save_task(user_id, status="cancelled")
+        await save_task(
+            user_id,
+            next_message_id=current,
+            success_count=success,
+            failed_count=failed,
+            status="cancelled",
+        )
         raise
     except Exception:
         log.exception("Forwarding task crashed for %s", user_id)
-        await save_task(user_id, status="error")
+        await save_task(
+            user_id,
+            next_message_id=current,
+            success_count=success,
+            failed_count=failed,
+            status="error",
+        )
 
 
 async def launch_saved_task(user_id: int):
@@ -454,6 +487,8 @@ async def speed_handler(message: Message):
             "Example: /speed 1 or /speed 3"
         )
 
+    # Update the in-process cache first so a running task sees this immediately.
+    speed_delays[uid] = delay
     await settings_col.update_one(
         {"_id": uid},
         {
@@ -578,16 +613,83 @@ async def forward_handler(message: Message):
 async def status_handler(message: Message):
     if not message.from_user:
         return
-    row = await tasks_col.find_one({"_id": message.from_user.id})
-    if not row:
-        return await message.answer("No forwarding task found.")
 
-    await message.answer(
-        f"Status: {row.get('status', 'unknown')}\n"
-        f"Next message ID: {row.get('next_message_id', 0)} / {row.get('end_message_id', 0)}\n"
-        f"Success: {row.get('success_count', 0)}\n"
-        f"Failed: {row.get('failed_count', 0)}"
+    uid = message.from_user.id
+    row = await tasks_col.find_one({"_id": uid})
+    settings = await settings_col.find_one(
+        {"_id": uid}, {"speed_delay": 1}
+    ) if settings_col is not None else None
+
+    # Collect host metrics without blocking the bot's asyncio event loop.
+    try:
+        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.2)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        uptime_seconds = max(0, int(__import__("time").monotonic() - APP_STARTED_MONOTONIC))
+        days, rem = divmod(uptime_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        uptime = (f"{days}d " if days else "") + f"{hours}h {minutes}m {seconds}s"
+        system_stats = (
+            f"▣ <b>SERVER STATS</b>\n"
+            f"├ CPU  · {cpu:.1f}%\n"
+            f"├ RAM  · {memory.percent:.1f}% ({memory.used / (1024**3):.1f}/{memory.total / (1024**3):.1f} GB)\n"
+            f"├ DISK · {disk.percent:.1f}% ({disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB)\n"
+            f"└ UP   · {uptime}"
+        )
+    except Exception:
+        log.exception("Could not collect server metrics")
+        system_stats = "▣ <b>SERVER STATS</b>\nMetrics temporarily unavailable."
+
+    delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
+
+    if not row:
+        dashboard = (
+            "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
+            "<i>Your personal status dashboard</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "◉ <b>FORWARDING</b>\n"
+            "└ No forwarding task found.\n\n"
+            f"⚡ <b>SPEED</b>\n└ {delay:g}s delay per message\n\n"
+            f"{system_stats}\n\n"
+            "<i>Start a task with /forward</i>"
+        )
+        return await message.answer(dashboard, parse_mode="HTML")
+
+    status = str(row.get("status", "unknown")).upper().replace("_", " ")
+    start_id = int(row.get("start_message_id", 0))
+    end_id = int(row.get("end_message_id", 0))
+    next_id = int(row.get("next_message_id", start_id))
+    total = max(0, end_id - start_id + 1)
+    processed = min(total, max(0, next_id - start_id))
+    remaining = max(0, total - processed)
+    percent = (processed / total * 100) if total else 0
+    filled = min(10, max(0, int(percent // 10)))
+    progress_bar = "█" * filled + "░" * (10 - filled)
+    success = int(row.get("success_count", 0))
+    failed = int(row.get("failed_count", 0))
+
+    task_stats = (
+        f"◉ <b>FORWARDING TASK</b>\n"
+        f"├ Status · <b>{status}</b>\n"
+        f"├ Progress · {progress_bar} {percent:.1f}%\n"
+        f"├ Messages · {processed:,}/{total:,}\n"
+        f"├ Remaining · {remaining:,}\n"
+        f"├ Success · <b>{success:,}</b>\n"
+        f"└ Failed · <b>{failed:,}</b>"
     )
+    speed_stats = f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message"
+
+    dashboard = (
+        "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
+        "<i>Personal status dashboard</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{task_stats}\n\n"
+        f"{speed_stats}\n\n"
+        f"{system_stats}\n\n"
+        "<i>Use /speed 1 to change delay · /cancel to stop</i>"
+    )
+    await message.answer(dashboard, parse_mode="HTML")
 
 
 @dp.message(Command("cancel"))
