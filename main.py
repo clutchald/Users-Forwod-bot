@@ -70,7 +70,7 @@ async def init_db():
     settings_col = db["user_settings"]
     tasks_col = db["forwarding_tasks"]
 
-    await users_col.create_index("_id", unique=True)
+
     await settings_col.create_index("_id", unique=True)
     await tasks_col.create_index("_id", unique=True)
     await tasks_col.create_index("status")
