@@ -1,5 +1,5 @@
 aiogram==3.22.0
 Pyrogram==2.0.106
 TgCrypto==1.2.5
-asyncpg==0.30.0
+pymongo>=4.13,<5
 aiohttp==3.12.15
