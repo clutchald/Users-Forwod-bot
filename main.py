@@ -254,7 +254,14 @@ async def run_forwarding(user_id: int, row: dict):
                     success_count=success,
                     failed_count=failed,
                 )
-                await asyncio.sleep(1.05)
+                # Read the user's current speed setting on every message so /speed
+                # changes take effect immediately, without restarting the task.
+                speed_row = await settings_col.find_one(
+                    {"_id": user_id}, {"speed_delay": 1}
+                ) if settings_col is not None else None
+                speed_delay = float(speed_row.get("speed_delay", 1.05)) if speed_row else 1.05
+                speed_delay = max(0.5, min(speed_delay, 30.0))
+                await asyncio.sleep(speed_delay)
 
             except FloodWait as exc:
                 await asyncio.sleep(int(getattr(exc, "value", 30)) + 1)
@@ -297,20 +304,31 @@ async def launch_saved_task(user_id: int):
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
-    await message.answer(
-        "Welcome to Multi-User Forwarder.\n\n"
-        "Each Telegram user connects their own user session.\n"
-        "/connect - connect your Telegram user session\n"
-        "/disconnect - remove your saved session\n"
-        "/forward SOURCE DEST START_ID END_ID - start forwarding\n"
-        "/status - view your forwarding status\n"
-        "/cancel - cancel your forwarding task\n"
-        "/caption TEXT - set forwarding caption\n"
-        "/dcaption - clear caption\n"
-        "/filter TYPE - toggle media type\n"
-        "/filters - show media filters\n"
-        "/help - show commands"
+    menu_text = (
+        "<b>✦  M U L T I  •  F O R W A R D E R</b>\n"
+        "<i>Powerful. Simple. Made for Telegram.</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>◈ ACCOUNT</b>\n"
+        "• <code>/connect</code> — Connect your Telegram session\n"
+        "• <code>/disconnect</code> — Remove your saved session\n\n"
+        "<b>◈ FORWARDING</b>\n"
+        "• <code>/forward SOURCE DEST START END</code> — Start a task\n"
+        "• <code>/status</code> — View task progress\n"
+        "• <code>/cancel</code> — Stop your active task\n"
+        "• <code>/speed [seconds]</code> — Set forwarding delay\n\n"
+        "<b>◈ CUSTOMIZATION</b>\n"
+        "• <code>/caption TEXT</code> — Set a custom caption\n"
+        "• <code>/dcaption</code> — Clear your caption\n"
+        "• <code>/filter TYPE</code> — Toggle a media filter\n"
+        "• <code>/filters</code> — View all media filters\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>⚡ QUICK START</b>\n"
+        "1. Connect your account with <code>/connect</code>\n"
+        "2. Set your preferred delay with <code>/speed 1</code>\n"
+        "3. Start using <code>/forward</code>\n\n"
+        "<i>Need help? Send /help</i>"
     )
+    await message.answer(menu_text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message(Command("help"))
@@ -388,6 +406,46 @@ async def delete_caption_handler(message: Message):
         upsert=True,
     )
     await message.answer("Your forwarding caption was cleared.")
+
+
+@dp.message(Command("speed", "forwardingspeed"))
+async def speed_handler(message: Message):
+    if not message.from_user:
+        return
+
+    uid = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) == 1:
+        row = await settings_col.find_one({"_id": uid}, {"speed_delay": 1})
+        delay = float(row.get("speed_delay", 1.05)) if row else 1.05
+        return await message.answer(
+            f"Current forwarding delay: {delay:g} seconds per message.\n"
+            "Set with /speed 2 (allowed range: 0.5 to 30 seconds)."
+        )
+
+    try:
+        delay = float(parts[1])
+        if not 0.5 <= delay <= 30:
+            raise ValueError
+    except ValueError:
+        return await message.answer(
+            "Invalid speed delay. Use a number from 0.5 to 30 seconds.\n"
+            "Example: /speed 1 or /speed 3"
+        )
+
+    await settings_col.update_one(
+        {"_id": uid},
+        {
+            "$set": {"speed_delay": delay, "updated_at": now_utc()},
+            "$setOnInsert": {"caption": "", "disabled_types": []},
+        },
+        upsert=True,
+    )
+    await message.answer(
+        f"Forwarding delay set to {delay:g} seconds per message. "
+        "The change applies to the next forwarded message."
+    )
 
 
 @dp.message(Command("filter"))
