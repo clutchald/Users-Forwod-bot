@@ -1,26 +1,36 @@
 
+# Python cache
 __pycache__/
 *.py[cod]
+*$py.class
 
-.venv/
+# Virtual environment
 venv/
+.venv/
 env/
 
+# Environment secrets
 .env
 .env.*
 !.env.example
 
+# Session files
 *.session
 *.session-journal
 
+# Logs
 *.log
 logs/
 
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# IDE
 .vscode/
 .idea/
+
+# OS files
 .DS_Store
 Thumbs.db
-
-build/
-dist/
-*.egg-info/
