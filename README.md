@@ -62,3 +62,8 @@ RAM guard checks container cgroup memory when available and pauses workers while
 User sessions are loaded on demand rather than all being started at boot; after a restart, /connect can reconnect a previously saved session.
 Admin commands are enabled only for numeric IDs listed in ADMIN_IDS.
 Note: this service uses one active task per Telegram user and a process-local worker semaphore. Run one Koyeb replica; multiple replicas would need a distributed queue/lock to enforce a global worker limit. Resume/retry behavior should be load-tested with your own Telegram accounts and chats before production use.
+
+
+### Admin restart
+
+`/restart` is restricted to IDs listed in `ADMIN_IDS`. It asks the bot to stop polling, checkpoint active tasks back into the queue, close clients and database connections, and replace the Python process. The hosting platform must allow the process to continue running after replacement.
