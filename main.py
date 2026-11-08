@@ -131,7 +131,7 @@ async def save_task(user_id: int, **values):
     if tasks_col is None:
         return
     allowed = {
-        "next_message_id", "success_count", "failed_count", "status",
+        "next_message_id", "success_count", "failed_count", "skipped_count", "status",
         "caption", "updated_at", "paused", "failed_message_ids", "sent_message_ids", "task_id", "retry_only"
     }
     update = {k: v for k, v in values.items() if k in allowed}
@@ -273,6 +273,7 @@ def register_userbot_commands(client: Client, user_id: int):
                         "next_message_id": start_id,
                         "success_count": 0,
                         "failed_count": 0,
+                        "skipped_count": 0,
                         "status": "queued",
                         "caption": "",
                         "updated_at": now_utc(),
@@ -394,6 +395,7 @@ async def run_forwarding(user_id: int, row: dict):
     end = int(row["end_message_id"])
     success = int(row.get("success_count", 0))
     failed = int(row.get("failed_count", 0))
+    skipped = int(row.get("skipped_count", 0))
     failed_ids = set(int(x) for x in row.get("failed_message_ids", []))
     sent_ids = set(int(x) for x in row.get("sent_message_ids", []))
     retry_only = bool(row.get("retry_only", False))
@@ -426,6 +428,7 @@ async def run_forwarding(user_id: int, row: dict):
             "next_message_id": current,
             "success_count": success,
             "failed_count": failed,
+            "skipped_count": skipped,
             "status": "running",
         }
         if force or processed_since_checkpoint >= PROGRESS_SAVE_EVERY:
@@ -434,6 +437,7 @@ async def run_forwarding(user_id: int, row: dict):
                 next_message_id=current,
                 success_count=success,
                 failed_count=failed,
+                skipped_count=skipped,
             )
             processed_since_checkpoint = 0
 
@@ -460,7 +464,7 @@ async def run_forwarding(user_id: int, row: dict):
         while current <= end and not shutdown_event.is_set():
             if not pause_event.is_set():
                 await save_task(user_id, status="paused", next_message_id=current)
-                live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "paused"}
+                live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "skipped_count": skipped, "status": "paused"}
                 await pause_event.wait()
                 if shutdown_event.is_set():
                     break
@@ -475,6 +479,7 @@ async def run_forwarding(user_id: int, row: dict):
                 message = await client.get_messages(source, current)
 
                 if not message or getattr(message, "empty", False) or getattr(message, "service", False):
+                    skipped += 1
                     current += 1
                     processed_since_checkpoint += 1
                     await checkpoint()
@@ -492,6 +497,7 @@ async def run_forwarding(user_id: int, row: dict):
                 )
 
                 if media_type in disabled_types:
+                    skipped += 1
                     current += 1
                     processed_since_checkpoint += 1
                     await checkpoint()
@@ -563,10 +569,10 @@ async def run_forwarding(user_id: int, row: dict):
 
         await checkpoint(force=True)
         if shutdown_event.is_set():
-            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "queued"}
+            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "skipped_count": skipped, "status": "queued"}
             await save_task(user_id, status="queued")
         else:
-            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "completed"}
+            live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "skipped_count": skipped, "status": "completed"}
             await save_task(user_id, status="completed", retry_only=False)
             log.info(
                 "Forwarding completed user=%s success=%s failed=%s",
@@ -576,23 +582,25 @@ async def run_forwarding(user_id: int, row: dict):
     except asyncio.CancelledError:
         shutdown = shutdown_event.is_set()
         final_status = "queued" if shutdown else "cancelled"
-        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": final_status}
+        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "skipped_count": skipped, "status": final_status}
         await save_task(
             user_id,
             next_message_id=current,
             success_count=success,
             failed_count=failed,
+            skipped_count=skipped,
             status=final_status,
         )
         raise
     except Exception:
         log.exception("Forwarding task crashed for %s", user_id)
-        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "status": "error"}
+        live_progress[user_id] = {"next_message_id": current, "success_count": success, "failed_count": failed, "skipped_count": skipped, "status": "error"}
         await save_task(
             user_id,
             next_message_id=current,
             success_count=success,
             failed_count=failed,
+            skipped_count=skipped,
             status="error",
         )
     finally:
@@ -938,6 +946,7 @@ async def forward_handler(message: Message):
                     "next_message_id": start_id,
                     "success_count": 0,
                     "failed_count": 0,
+                    "skipped_count": 0,
                     "status": "queued",
                     "caption": "",
                     "updated_at": now_utc(),
@@ -1004,6 +1013,7 @@ async def build_status_dashboard(uid: int):
     bar = "▰" * filled + "▱" * (20 - filled)
     success = int(live.get("success_count", row.get("success_count", 0)))
     failed = int(live.get("failed_count", row.get("failed_count", 0)))
+    skipped = int(live.get("skipped_count", row.get("skipped_count", 0)))
 
     dashboard = (
         "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
@@ -1015,7 +1025,9 @@ async def build_status_dashboard(uid: int):
         f"├ Messages · {processed:,}/{total:,}\n"
         f"├ Remaining · {remaining:,}\n"
         f"├ Success · <b>{success:,}</b>\n"
-        f"└ Failed · <b>{failed:,}</b>\n\n"
+        f"├ Failed · <b>{failed:,}</b>\n"
+        f"├ Skipped · <b>{skipped:,}</b>\n"
+        f"└ Remaining · <b>{remaining:,}</b>\n\n"
         f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message\n\n"
         f"{system_stats}\n\n"
         f"<i>Auto-refresh: every 2 seconds · Queue limit: {MAX_CONCURRENT_FORWARDING} workers</i>"
