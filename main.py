@@ -834,8 +834,9 @@ async def handle_session_generation_input(message: Message, uid: int) -> bool:
         elif flow["stage"] == "password":
             await auth_client.check_password(text_value)
 
-        session_string = await auth_client.export_session_string()
+        # Fetch the authenticated user first; Pyrogram populates session user metadata here.
         me = await auth_client.get_me()
+        session_string = await auth_client.export_session_string()
         # Deliver only to the authenticated account's own Saved Messages.
         await auth_client.send_message(
             "me",
@@ -859,7 +860,7 @@ async def handle_session_generation_input(message: Message, uid: int) -> bool:
         return True
 
     except Exception as exc:
-        log.warning("Session generation failed for user %s: %s", uid, type(exc).__name__)
+        log.exception("Session generation failed for user %s (%s)", uid, type(exc).__name__)
         pending_session_generation.pop(uid, None)
         with suppress(Exception):
             await auth_client.disconnect()
