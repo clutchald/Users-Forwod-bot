@@ -15,6 +15,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, Message
 from pyrogram import Client, filters
+from pyrogram.enums import MessageEntityType
+from pyrogram.types import MessageEntity
 from pyrogram.handlers import MessageHandler
 from pyrogram.errors import FloodWait, RPCError
 from pymongo import AsyncMongoClient
@@ -837,13 +839,21 @@ async def handle_session_generation_input(message: Message, uid: int) -> bool:
         # Fetch the authenticated account first, then export its session.
         me = await auth_client.get_me()
         session_string = await auth_client.export_session_string()
-        # Pyrogram 2.0.106 does not accept the string "HTML" as parse_mode.
-        # Send plain text to the authenticated account's own Saved Messages.
+        # Send the session as a CODE entity so Telegram displays it in monospace
+        # and makes it easy to select/copy. The session itself is kept unformatted.
+        session_prefix = "Your new Pyrogram String Session\n\n"
+        session_suffix = "\n\nKeep this private. Anyone with this string may access your Telegram account."
+        saved_text = session_prefix + session_string + session_suffix
         await auth_client.send_message(
             "me",
-            "Your new Pyrogram String Session\n\n"
-            + session_string
-            + "\n\nKeep this private. Anyone with this string may access your Telegram account.",
+            saved_text,
+            entities=[
+                MessageEntity(
+                    type=MessageEntityType.CODE,
+                    offset=len(session_prefix),
+                    length=len(session_string),
+                )
+            ],
         )
         await auth_client.disconnect()
         pending_session_generation.pop(uid, None)
