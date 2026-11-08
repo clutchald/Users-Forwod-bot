@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import logging
 import os
+import sys
 from pathlib import Path
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -60,6 +62,7 @@ pause_events: dict[int, asyncio.Event] = {}
 userbot_handler_clients: dict[int, Client] = {}
 pending_connect: set[int] = set()
 shutdown_event = asyncio.Event()
+restart_requested = False
 forwarding_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FORWARDING)
 APP_STARTED_MONOTONIC = __import__('time').monotonic()
 
@@ -79,6 +82,7 @@ async def setup_bot_commands():
         BotCommand(command="retry", description="Retry failed messages"),
         BotCommand(command="history", description="View recent task history"),
         BotCommand(command="admin", description="Admin controls"),
+        BotCommand(command="restart", description="Restart the bot (admin only)"),
         BotCommand(command="speed", description="Set or view forwarding speed"),
         BotCommand(command="caption", description="Set or view forwarding caption"),
         BotCommand(command="dcaption", description="Clear forwarding caption"),
@@ -178,6 +182,26 @@ def container_memory_available_mb() -> float:
     except Exception:
         pass
     return psutil.virtual_memory().available / (1024 * 1024)
+
+
+def container_memory_usage_mb() -> tuple[float, float]:
+    """Return container memory used/limit in MB, preferring cgroup metrics."""
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        limit = int(Path("/sys/fs/cgroup/memory.max").read_text().strip())
+        if 0 < limit < (1 << 60):
+            return current / (1024 * 1024), limit / (1024 * 1024)
+    except Exception:
+        pass
+    try:
+        current = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip())
+        if 0 < limit < (1 << 60):
+            return current / (1024 * 1024), limit / (1024 * 1024)
+    except Exception:
+        pass
+    vm = psutil.virtual_memory()
+    return (vm.total - vm.available) / (1024 * 1024), vm.total / (1024 * 1024)
 
 
 async def is_blocked(user_id: int) -> bool:
@@ -571,6 +595,22 @@ async def run_forwarding(user_id: int, row: dict):
             failed_count=failed,
             status="error",
         )
+    finally:
+        # Release per-task objects; keep logged-in client alive for .id/.f commands.
+        with suppress(Exception):
+            del message
+        with suppress(Exception):
+            del sent_ids
+        with suppress(Exception):
+            del failed_ids
+        with suppress(Exception):
+            del pause_event
+        gc.collect()
+        # Return free heap pages to the Linux container when glibc supports it.
+        with suppress(Exception):
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        log.info("Task memory cleanup completed for user %s", user_id)
 
 
 async def run_queued_forwarding(user_id: int):
@@ -917,8 +957,10 @@ async def build_status_dashboard(uid: int):
     delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
 
     try:
-        cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
-        memory = psutil.virtual_memory()
+        cpu = await asyncio.to_thread(psutil.Process().cpu_percent, 0.1)
+        used_mb, limit_mb = container_memory_usage_mb()
+        ram_percent = (used_mb / limit_mb * 100) if limit_mb else 0.0
+        process_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         disk = psutil.disk_usage("/")
         uptime_seconds = max(0, int(__import__("time").monotonic() - APP_STARTED_MONOTONIC))
         days, rem = divmod(uptime_seconds, 86400)
@@ -927,9 +969,10 @@ async def build_status_dashboard(uid: int):
         uptime = (f"{days}d " if days else "") + f"{hours}h {minutes}m {seconds}s"
         system_stats = (
             f"▣ <b>SERVER STATS</b>\n"
-            f"├ CPU  · {cpu:.1f}%\n"
-            f"├ RAM  · {memory.percent:.1f}% ({memory.used / (1024**3):.1f}/{memory.total / (1024**3):.1f} GB)\n"
-            f"├ DISK · {disk.percent:.1f}% ({disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB)\n"
+            f"├ CPU  · {cpu:.1f}% (process)\n"
+            f"├ RAM  · {ram_percent:.1f}% ({used_mb:.0f}/{limit_mb:.0f} MB container)\n"
+            f"├ APP  · {process_rss_mb:.0f} MB process RAM\n"
+            f"├ DISK · {disk.percent:.1f}% ({disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB filesystem)\n"
             f"└ UP   · {uptime}"
         )
     except Exception:
@@ -1122,6 +1165,23 @@ async def admin_handler(message: Message):
     )
 
 
+@dp.message(Command("restart"))
+async def restart_handler(message: Message):
+    """Gracefully stop workers and replace the process; admin only."""
+    global restart_requested
+    if not message.from_user or not is_admin(message.from_user.id):
+        return await message.answer("Admin only.")
+    if restart_requested:
+        return await message.answer("Restart is already in progress.")
+    restart_requested = True
+    await message.answer(
+        "♻️ Restart requested. Active forwarding tasks will be checkpointed and returned to the queue. "
+        "The service will reconnect automatically if the hosting platform allows process replacement."
+    )
+    # Stop polling so main() can run its normal graceful-shutdown path.
+    await dp.stop_polling()
+
+
 @dp.message(Command("block"))
 async def block_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1269,6 +1329,10 @@ async def main():
 
         if mongo_client is not None:
             await mongo_client.close()
+
+    if restart_requested:
+        log.warning("Replacing process after administrator restart request")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":
