@@ -36,7 +36,7 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_forwarder")
 PORT = int(os.getenv("PORT", "8000"))
 # Maximum number of forwarding jobs allowed to run at the same time.
 # Keep this at 2 for a 512 MB Koyeb instance.
-MAX_CONCURRENT_FORWARDING = max(1, int(os.getenv("MAX_CONCURRENT_FORWARDING", "2")))
+MAX_CONCURRENT_FORWARDING = max(1, int(os.getenv("MAX_CONCURRENT_FORWARDING", "7")))
 MIN_FREE_RAM_MB = max(40, int(os.getenv("MIN_FREE_RAM_MB", "75")))
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
