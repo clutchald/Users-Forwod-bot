@@ -834,16 +834,16 @@ async def handle_session_generation_input(message: Message, uid: int) -> bool:
         elif flow["stage"] == "password":
             await auth_client.check_password(text_value)
 
-        # Fetch the authenticated user first; Pyrogram populates session user metadata here.
+        # Fetch the authenticated account first, then export its session.
         me = await auth_client.get_me()
         session_string = await auth_client.export_session_string()
-        # Deliver only to the authenticated account's own Saved Messages.
+        # Pyrogram 2.0.106 does not accept the string "HTML" as parse_mode.
+        # Send plain text to the authenticated account's own Saved Messages.
         await auth_client.send_message(
             "me",
-            "<b>Your new Pyrogram String Session</b>\n\n"
-            "<code>" + session_string + "</code>\n\n"
-            "Keep this private. Anyone with this string may access your Telegram account.",
-            parse_mode="HTML",
+            "Your new Pyrogram String Session\n\n"
+            + session_string
+            + "\n\nKeep this private. Anyone with this string may access your Telegram account.",
         )
         await auth_client.disconnect()
         pending_session_generation.pop(uid, None)
@@ -860,7 +860,7 @@ async def handle_session_generation_input(message: Message, uid: int) -> bool:
         return True
 
     except Exception as exc:
-        log.exception("Session generation failed for user %s (%s)", uid, type(exc).__name__)
+        log.warning("Session generation failed for user %s: %s", uid, type(exc).__name__)
         pending_session_generation.pop(uid, None)
         with suppress(Exception):
             await auth_client.disconnect()
