@@ -34,7 +34,7 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_forwarder")
 PORT = int(os.getenv("PORT", "8000"))
 # Maximum number of forwarding jobs allowed to run at the same time.
 # Keep this at 2 for a 512 MB Koyeb instance.
-MAX_CONCURRENT_FORWARDING = max(1, int(os.getenv("MAX_CONCURRENT_FORWARDING", "5")))
+MAX_CONCURRENT_FORWARDING = max(1, int(os.getenv("MAX_CONCURRENT_FORWARDING", "2")))
 MIN_FREE_RAM_MB = max(40, int(os.getenv("MIN_FREE_RAM_MB", "75")))
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
@@ -61,6 +61,7 @@ status_monitors: dict[int, asyncio.Task] = {}
 pause_events: dict[int, asyncio.Event] = {}
 userbot_handler_clients: dict[int, Client] = {}
 pending_connect: set[int] = set()
+pending_session_generation: dict[int, dict] = {}  # Per-user OTP/password login flow
 shutdown_event = asyncio.Event()
 restart_requested = False
 forwarding_semaphore = asyncio.Semaphore(MAX_CONCURRENT_FORWARDING)
@@ -73,6 +74,8 @@ async def setup_bot_commands():
         BotCommand(command="start", description="Open the main menu"),
         BotCommand(command="help", description="Show all commands and help"),
         BotCommand(command="connect", description="Connect your Telegram session"),
+        BotCommand(command="generate_session", description="Generate your own Telegram session"),
+        BotCommand(command="cancel_session", description="Cancel session generation"),
         BotCommand(command="disconnect", description="Remove your saved session"),
         BotCommand(command="forward", description="Start a forwarding task"),
         BotCommand(command="status", description="Check forwarding progress"),
@@ -504,6 +507,7 @@ async def run_forwarding(user_id: int, row: dict):
                     continue
 
                 if current in sent_ids:
+                    skipped += 1
                     current += 1
                     processed_since_checkpoint += 1
                     await checkpoint()
@@ -673,6 +677,7 @@ async def start_handler(message: Message):
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>◈ ACCOUNT</b>\n"
         "• <code>/connect</code> — Connect your Telegram session\n"
+        "• <code>/generate_session</code> — Generate a session and save it to Saved Messages\n"
         "• <code>/disconnect</code> — Remove your saved session\n\n"
         "<b>◈ FORWARDING</b>\n"
         "• <code>/forward SOURCE DEST START END</code> — Start a task\n"
@@ -736,6 +741,135 @@ async def connect_handler(message: Message):
         "The session will be stored in MongoDB without application-level encryption. "
         "Do not share it with anyone else."
     )
+
+
+@dp.message(Command("generate_session"))
+async def generate_session_handler(message: Message):
+    """Start a per-user Telegram login and export its Pyrogram string session."""
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    if message.chat.type != "private":
+        return await message.answer("For security, use /generate_session in this bot's private chat.")
+    if await is_blocked(uid):
+        return await message.answer("Your access is blocked.")
+    if uid in pending_session_generation:
+        return await message.answer("A session-generation flow is already active. Send /cancel_session to stop it.")
+
+    auth_client = Client(
+        name=f"session_generator_{uid}", api_id=API_ID, api_hash=API_HASH,
+        in_memory=True, no_updates=True,
+    )
+    try:
+        await auth_client.connect()
+    except Exception as exc:
+        with suppress(Exception):
+            await auth_client.disconnect()
+        log.exception("Could not initialize session generator for %s", uid)
+        return await message.answer(f"Could not start Telegram login: {type(exc).__name__}. Try again later.")
+
+    pending_session_generation[uid] = {"client": auth_client, "stage": "phone"}
+    await message.answer(
+        "<b>Generate your personal Telegram session</b>\n\n"
+        "Send your phone number with country code (example: <code>+919876543210</code>).\n"
+        "You will receive Telegram's login code. Never share that code with anyone.\n\n"
+        "Send /cancel_session to cancel.", parse_mode="HTML"
+    )
+
+
+@dp.message(Command("cancel_session"))
+async def cancel_session_generation(message: Message):
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    flow = pending_session_generation.pop(uid, None)
+    if flow:
+        with suppress(Exception):
+            await flow["client"].disconnect()
+        return await message.answer("Session generation cancelled. No new session was saved.")
+    await message.answer("There is no active session-generation request.")
+
+
+async def handle_session_generation_input(message: Message, uid: int) -> bool:
+    """Consume phone, OTP, and optional 2FA password messages for this user."""
+    flow = pending_session_generation.get(uid)
+    if not flow:
+        return False
+
+    # Delete OTP/password/phone messages where Telegram permits it.
+    text_value = (message.text or "").strip()
+    with suppress(Exception):
+        await message.delete()
+
+    auth_client = flow["client"]
+    try:
+        if flow["stage"] == "phone":
+            phone = text_value.replace(" ", "")
+            if not phone.startswith("+") or not phone[1:].isdigit() or not 8 <= len(phone[1:]) <= 15:
+                await bot.send_message(uid, "Invalid phone number. Send it in international format, e.g. <code>+919876543210</code>.", parse_mode="HTML")
+                return True
+            sent_code = await auth_client.send_code(phone)
+            flow.update({"stage": "code", "phone": phone, "phone_code_hash": sent_code.phone_code_hash})
+            await bot.send_message(uid, "Telegram login code sent. Send the code here (not in any group).")
+            return True
+
+        if flow["stage"] == "code":
+            code = "".join(ch for ch in text_value if ch.isdigit())
+            if not 4 <= len(code) <= 8:
+                await bot.send_message(uid, "That code format looks incorrect. Send the Telegram login code again.")
+                return True
+            try:
+                await auth_client.sign_in(
+                    phone_number=flow["phone"],
+                    phone_code_hash=flow["phone_code_hash"],
+                    phone_code=code,
+                )
+            except Exception as exc:
+                if type(exc).__name__ == "SessionPasswordNeeded":
+                    flow["stage"] = "password"
+                    await bot.send_message(uid, "Two-Step Verification is enabled. Send your Telegram 2-Step Verification password.")
+                    return True
+                raise
+
+        elif flow["stage"] == "password":
+            await auth_client.check_password(text_value)
+
+        session_string = await auth_client.export_session_string()
+        me = await auth_client.get_me()
+        # Deliver only to the authenticated account's own Saved Messages.
+        await auth_client.send_message(
+            "me",
+            "<b>Your new Pyrogram String Session</b>\n\n"
+            "<code>" + session_string + "</code>\n\n"
+            "Keep this private. Anyone with this string may access your Telegram account.",
+            parse_mode="HTML",
+        )
+        await auth_client.disconnect()
+        pending_session_generation.pop(uid, None)
+
+        # Attach this generated session to the user's existing multi-user bot profile.
+        await connect_user_session(uid, session_string)
+        await bot.send_message(
+            uid,
+            f"<b>Session generated successfully.</b>\nAccount: {me.first_name or 'Telegram user'}\n\n"
+            "Your session was sent to your Telegram Saved Messages and connected to this bot.",
+            parse_mode="HTML",
+        )
+        await launch_saved_task(uid)
+        return True
+
+    except Exception as exc:
+        log.warning("Session generation failed for user %s: %s", uid, type(exc).__name__)
+        pending_session_generation.pop(uid, None)
+        with suppress(Exception):
+            await auth_client.disconnect()
+        await bot.send_message(
+            uid,
+            f"Session generation failed: <code>{type(exc).__name__}</code>.\n"
+            "Start again with /generate_session. If Telegram reports an expired code, request a new one.",
+            parse_mode="HTML",
+        )
+        return True
 
 
 @dp.message(Command("disconnect"))
@@ -966,11 +1100,10 @@ async def build_status_dashboard(uid: int):
     delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
 
     try:
-        process = psutil.Process()
-        cpu = await asyncio.to_thread(process.cpu_percent, 0.1)
+        cpu = await asyncio.to_thread(psutil.Process().cpu_percent, 0.1)
         used_mb, limit_mb = container_memory_usage_mb()
         ram_percent = (used_mb / limit_mb * 100) if limit_mb else 0.0
-        process_rss_mb = process.memory_info().rss / (1024 * 1024)
+        process_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         disk = psutil.disk_usage("/")
         uptime_seconds = max(0, int(__import__("time").monotonic() - APP_STARTED_MONOTONIC))
         days, rem = divmod(uptime_seconds, 86400)
@@ -989,27 +1122,28 @@ async def build_status_dashboard(uid: int):
         log.exception("Could not collect server metrics")
         system_stats = "▣ <b>SERVER STATS</b>\nMetrics temporarily unavailable."
 
-    active_statuses = {"queued", "running", "waiting_for_session", "waiting_for_memory", "paused"}
-    db_status = str((row or {}).get("status", "")).lower()
     live = live_progress.get(uid, {})
+    db_status = str((row or {}).get("status", "")).lower()
     live_status = str(live.get("status", db_status)).lower()
+    active_statuses = {"queued", "running", "waiting_for_session", "waiting_for_memory", "paused"}
     is_active = bool(row) and (db_status in active_statuses or live_status in active_statuses)
 
     if not is_active:
         return (
-            "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
-            "<i>Live personal status dashboard</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "◉ <b>FORWARDING STATUS</b>\n"
-            "├ Status · <b>IDLE</b>\n"
-            "├ Active Tasks · 0\n"
-            "└ No forwarding task is running.\n\n"
-            f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message\n\n"
-            f"{system_stats}\n\n"
-            "<i>Use /forward to start a task · /history to view completed tasks</i>",
+            "✦ <b>M U L T I  ·  F O R W A R D E R</b>\\n"
+            "<i>Live personal status dashboard</i>\\n"
+            "━━━━━━━━━━━━━━━━━━━━\\n\\n"
+            "◉ <b>FORWARDING STATUS</b>\\n"
+            "├ Status · <b>IDLE</b>\\n"
+            "├ Active Tasks · 0\\n"
+            "└ No forwarding task is running.\\n\\n"
+            f"⚡ <b>FORWARDING SPEED</b>\\n└ {delay:g}s delay per message\\n\\n"
+            f"{system_stats}\\n\\n"
+            "<i>Use /forward to start · /history to view completed tasks</i>",
             "idle",
         )
 
+    status = live_status.upper().replace("_", " ")
     start_id = int(row.get("start_message_id", 0))
     end_id = int(row.get("end_message_id", 0))
     next_id = int(live.get("next_message_id", row.get("next_message_id", start_id)))
@@ -1022,7 +1156,6 @@ async def build_status_dashboard(uid: int):
     success = int(live.get("success_count", row.get("success_count", 0)))
     failed = int(live.get("failed_count", row.get("failed_count", 0)))
     skipped = int(live.get("skipped_count", row.get("skipped_count", 0)))
-    status = live_status.upper().replace("_", " ")
 
     dashboard = (
         "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
@@ -1032,6 +1165,7 @@ async def build_status_dashboard(uid: int):
         f"├ Status · <b>{status}</b>\n"
         f"├ Progress · {bar} <b>{percent:.1f}%</b>\n"
         f"├ Messages · {processed:,}/{total:,}\n"
+        f"├ Remaining · {remaining:,}\n"
         f"├ Success · <b>{success:,}</b>\n"
         f"├ Failed · <b>{failed:,}</b>\n"
         f"├ Skipped · <b>{skipped:,}</b>\n"
@@ -1040,7 +1174,7 @@ async def build_status_dashboard(uid: int):
         f"{system_stats}\n\n"
         f"<i>Auto-refresh: every 2 seconds · Queue limit: {MAX_CONCURRENT_FORWARDING} workers</i>"
     )
-    return dashboard, live_status
+    return dashboard, status.lower()
 
 
 async def refresh_status_message(chat_id: int, message_id: int, uid: int):
@@ -1246,10 +1380,15 @@ async def admincancel_handler(message: Message):
 
 @dp.message(F.text)
 async def session_message_handler(message: Message):
-    if not message.from_user or message.from_user.id not in pending_connect:
+    if not message.from_user:
         return
 
     uid = message.from_user.id
+    if uid in pending_session_generation:
+        await handle_session_generation_input(message, uid)
+        return
+    if uid not in pending_connect:
+        return
     if await is_blocked(uid):
         pending_connect.discard(uid)
         return await message.answer("Your access is blocked.")
@@ -1342,6 +1481,11 @@ async def main():
         for client in list(clients.values()):
             with suppress(Exception):
                 await client.stop()
+
+        for flow in list(pending_session_generation.values()):
+            with suppress(Exception):
+                await flow["client"].disconnect()
+        pending_session_generation.clear()
 
         with suppress(Exception):
             await bot.session.close()
