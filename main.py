@@ -966,10 +966,11 @@ async def build_status_dashboard(uid: int):
     delay = float(settings.get("speed_delay", 1.05)) if settings else 1.05
 
     try:
-        cpu = await asyncio.to_thread(psutil.Process().cpu_percent, 0.1)
+        process = psutil.Process()
+        cpu = await asyncio.to_thread(process.cpu_percent, 0.1)
         used_mb, limit_mb = container_memory_usage_mb()
         ram_percent = (used_mb / limit_mb * 100) if limit_mb else 0.0
-        process_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        process_rss_mb = process.memory_info().rss / (1024 * 1024)
         disk = psutil.disk_usage("/")
         uptime_seconds = max(0, int(__import__("time").monotonic() - APP_STARTED_MONOTONIC))
         days, rem = divmod(uptime_seconds, 86400)
@@ -977,31 +978,38 @@ async def build_status_dashboard(uid: int):
         minutes, seconds = divmod(rem, 60)
         uptime = (f"{days}d " if days else "") + f"{hours}h {minutes}m {seconds}s"
         system_stats = (
-            f"▣ <b>SERVER STATS</b>\n"
-            f"├ CPU  · {cpu:.1f}% (process)\n"
-            f"├ RAM  · {ram_percent:.1f}% ({used_mb:.0f}/{limit_mb:.0f} MB container)\n"
-            f"├ APP  · {process_rss_mb:.0f} MB process RAM\n"
-            f"├ DISK · {disk.percent:.1f}% ({disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB filesystem)\n"
+            f"▣ <b>SERVER STATS</b>\\n"
+            f"├ CPU  · {cpu:.1f}% (process)\\n"
+            f"├ RAM  · {ram_percent:.1f}% ({used_mb:.0f}/{limit_mb:.0f} MB container)\\n"
+            f"├ APP  · {process_rss_mb:.0f} MB process RAM\\n"
+            f"├ DISK · {disk.percent:.1f}% ({disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB filesystem)\\n"
             f"└ UP   · {uptime}"
         )
     except Exception:
         log.exception("Could not collect server metrics")
-        system_stats = "▣ <b>SERVER STATS</b>\nMetrics temporarily unavailable."
+        system_stats = "▣ <b>SERVER STATS</b>\\nMetrics temporarily unavailable."
 
-    if not row:
+    active_statuses = {"queued", "running", "waiting_for_session", "waiting_for_memory", "paused"}
+    db_status = str((row or {}).get("status", "")).lower()
+    live = live_progress.get(uid, {})
+    live_status = str(live.get("status", db_status)).lower()
+    is_active = bool(row) and (db_status in active_statuses or live_status in active_statuses)
+
+    if not is_active:
         return (
-            "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
-            "<i>Live personal dashboard</i>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "◉ <b>FORWARDING</b>\n└ No forwarding task found.\n\n"
-            f"⚡ <b>SPEED</b>\n└ {delay:g}s delay per message\n\n"
-            f"{system_stats}\n\n"
-            "<i>Start a task with /forward</i>",
-            "unknown",
+            "✦ <b>M U L T I  ·  F O R W A R D E R</b>\\n"
+            "<i>Live personal status dashboard</i>\\n"
+            "━━━━━━━━━━━━━━━━━━━━\\n\\n"
+            "◉ <b>FORWARDING STATUS</b>\\n"
+            "├ Status · <b>IDLE</b>\\n"
+            "├ Active Tasks · 0\\n"
+            "└ No forwarding task is running.\\n\\n"
+            f"⚡ <b>FORWARDING SPEED</b>\\n└ {delay:g}s delay per message\\n\\n"
+            f"{system_stats}\\n\\n"
+            "<i>Use /forward to start a task · /history to view completed tasks</i>",
+            "idle",
         )
 
-    live = live_progress.get(uid, {})
-    status = str(live.get("status", row.get("status", "unknown"))).upper().replace("_", " ")
     start_id = int(row.get("start_message_id", 0))
     end_id = int(row.get("end_message_id", 0))
     next_id = int(live.get("next_message_id", row.get("next_message_id", start_id)))
@@ -1014,25 +1022,25 @@ async def build_status_dashboard(uid: int):
     success = int(live.get("success_count", row.get("success_count", 0)))
     failed = int(live.get("failed_count", row.get("failed_count", 0)))
     skipped = int(live.get("skipped_count", row.get("skipped_count", 0)))
+    status = live_status.upper().replace("_", " ")
 
     dashboard = (
-        "✦ <b>M U L T I  ·  F O R W A R D E R</b>\n"
-        "<i>Live personal status dashboard</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "◉ <b>FORWARDING TASK</b>\n"
-        f"├ Status · <b>{status}</b>\n"
-        f"├ Progress · {bar} <b>{percent:.1f}%</b>\n"
-        f"├ Messages · {processed:,}/{total:,}\n"
-        f"├ Remaining · {remaining:,}\n"
-        f"├ Success · <b>{success:,}</b>\n"
-        f"├ Failed · <b>{failed:,}</b>\n"
-        f"├ Skipped · <b>{skipped:,}</b>\n"
-        f"└ Remaining · <b>{remaining:,}</b>\n\n"
-        f"⚡ <b>FORWARDING SPEED</b>\n└ {delay:g}s delay per message\n\n"
-        f"{system_stats}\n\n"
+        "✦ <b>M U L T I  ·  F O R W A R D E R</b>\\n"
+        "<i>Live personal status dashboard</i>\\n"
+        "━━━━━━━━━━━━━━━━━━━━\\n\\n"
+        "◉ <b>FORWARDING TASK</b>\\n"
+        f"├ Status · <b>{status}</b>\\n"
+        f"├ Progress · {bar} <b>{percent:.1f}%</b>\\n"
+        f"├ Messages · {processed:,}/{total:,}\\n"
+        f"├ Success · <b>{success:,}</b>\\n"
+        f"├ Failed · <b>{failed:,}</b>\\n"
+        f"├ Skipped · <b>{skipped:,}</b>\\n"
+        f"└ Remaining · <b>{remaining:,}</b>\\n\\n"
+        f"⚡ <b>FORWARDING SPEED</b>\\n└ {delay:g}s delay per message\\n\\n"
+        f"{system_stats}\\n\\n"
         f"<i>Auto-refresh: every 2 seconds · Queue limit: {MAX_CONCURRENT_FORWARDING} workers</i>"
     )
-    return dashboard, status.lower()
+    return dashboard, live_status
 
 
 async def refresh_status_message(chat_id: int, message_id: int, uid: int):
@@ -1172,7 +1180,7 @@ async def admin_handler(message: Message):
         "<b>Admin panel</b>\n"
         f"Connected sessions: {total_users}\nBlocked users: {blocked}\n"
         f"Active tasks: {active}/{MAX_CONCURRENT_FORWARDING}\nQueued/paused: {queued}\n"
-        "Commands: /block USER_ID, /unblock USER_ID, /admincancel USER_ID",
+        "Admin commands: /restart, /block USER_ID, /unblock USER_ID, /admincancel USER_ID",
         parse_mode="HTML",
     )
 
